@@ -22,6 +22,8 @@
 - scikit-learn==1.0.2
 - nltk==3.7
 
+We directly provide the "cov" matrix of Llama3-8B-instruct that we have already calculated. [https://drive.google.com/file/d/1GhDb4vPd1NIyRCbbIlgXV45xbE2UQMav/view?usp=sharing](https://drive.google.com/file/d/1rAeGBJccEaZYFpPMlD5tb5TNjkaUqwq6/view?usp=drive_link)
+After decompressing it and saving it to the "./data/stats" folder.
 ## Quick Start
 ### An example for editing Llama3 (8B) on counterfact dataset using NSE
 #### 1. Edit Llama3 (8B) model 
