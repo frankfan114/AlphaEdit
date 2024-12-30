@@ -25,7 +25,7 @@
 We directly provide the "cov" matrix of Llama3-8B-instruct that we have already calculated. [https://drive.google.com/file/d/1GhDb4vPd1NIyRCbbIlgXV45xbE2UQMav/view?usp=sharing](https://drive.google.com/file/d/1rAeGBJccEaZYFpPMlD5tb5TNjkaUqwq6/view?usp=drive_link)
 After decompressing it and saving it to the "./data/stats" folder.
 ## Quick Start
-### An example for editing Llama3 (8B) on counterfact dataset using NSE
+### An example for editing Llama3 (8B) on counterfact dataset using AlphaEdit
 #### 1. Edit Llama3 (8B) model 
  
     python3 -m experiments.evaluate     --alg_name=AlphaEdit     --model_name=meta-llama/Meta-Llama-3-8B-Instruct     --hparams_fname=Llama3-8B.json --ds_name=mcf --dataset_size_limit=2000    --num_edits=100 --downstream_eval_steps=5
