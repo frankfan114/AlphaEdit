@@ -39,8 +39,20 @@ This command runs an evaluation script for the AlphaEdit algorithm using the Lla
 - `--dataset_size_limit=2000`: Sets the total number of editing samples to 2000.
 - `--num_edits=100`: Defines the batch size for each round of editing, meaning 100 edits will be performed in each batch. 
 - `--downstream_eval_steps=5`: indicates that a test of general capabilities is conducted after every 5 rounds of editing.
-#### 2. Summarize the results
+Results from each run are stored at `results/<method_name>/run_<run_id>` in a specific format:
+```bash
+results/
+|__ AlphaEdit/
+    |__ run_<run_id>/
+        |__ params.json
+        |__ case_0.json
+        |__ case_1.json
+        |__ ...
+        |__ case_10000.json
+```
 
+#### 2. Summarize the results  
+To summarize the results, you can use [`experiments/summarize.py`](experiments/summarize.py):
     python summarize.py --dir_name=AlphaEdit --runs=run_<run1>,run_<run2>
 
 ## Acknowledgment
