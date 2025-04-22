@@ -204,7 +204,7 @@ def main(
     if alg_name == "AlphaEdit":
         for i, layer in enumerate(hparams.layers):
             P[i,:,:] = get_project(model,tok,layer,hparams)
-        torch.save(P, "null_space_project.pt")
+        #torch.save(P, f"./null_space/{hparams.model_name}_null_space_project.pt")
     glue_save_location = str(run_dir) + '/' + 'glue_eval/'
     os.makedirs(glue_save_location, exist_ok=True)
     cnt = 0
