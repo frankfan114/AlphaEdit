@@ -1,5 +1,4 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 import json
 import shutil
 from itertools import islice
@@ -197,7 +196,7 @@ def main(
             cache_c = torch.zeros((len(hparams.layers), W_out.shape[0], W_out.shape[0]), device="cpu")
             if alg_name == "AlphaEdit":
                 P = torch.zeros((len(hparams.layers), W_out.shape[0], W_out.shape[0]), device="cpu")
-        elif hparams.model_name in ["EleutherAI_gpt-j-6B","Llama3-8B"]:
+        elif hparams.model_name in ["EleutherAI_gpt-j-6B","Llama3-8B","phi-1.5"]:
             cache_c = torch.zeros((len(hparams.layers), W_out.shape[1], W_out.shape[1]), device="cpu")
             if alg_name == "AlphaEdit":
                 P = torch.zeros((len(hparams.layers), W_out.shape[1], W_out.shape[1]), device="cpu")
@@ -206,17 +205,6 @@ def main(
         for i, layer in enumerate(hparams.layers):
             P[i,:,:] = get_project(model,tok,layer,hparams)
         torch.save(P, "null_space_project.pt")
-    # hs = get_module_input_output_at_words(
-    #         model,
-    #         tok,
-    #         hparams.layers[-1],
-    #         context_templates=[request["template"] for request in eval_ds],
-    #         words=[request["subject"] for request in eval_ds],
-    #         module_template=hparams.layer_module_tmp,
-    #         fact_token_strategy=hparams.fact_token,
-    #     )[1].T
-    # torch.save(hs, "pre_edit_hs.pt")
-    # del hs
     glue_save_location = str(run_dir) + '/' + 'glue_eval/'
     os.makedirs(glue_save_location, exist_ok=True)
     cnt = 0
@@ -358,16 +346,6 @@ def main(
             output_filename = out_file.replace('.json', '_glue.json')
             with open(output_filename, "w") as f:
                 json.dump(glue_results, f, indent=4)
-    hs = get_module_input_output_at_words(
-            edited_model,
-            tok,
-            hparams.layers[-1],
-            context_templates=[request["template"] for request in eval_ds],
-            words=[request["subject"] for request in eval_ds],
-            module_template=hparams.layer_module_tmp,
-            fact_token_strategy=hparams.fact_token,
-        )[1].T
-    torch.save(hs, "post_edit_hs_memit.pt")
     start = time()
     gen_test_vars = [snips, vec]
     for record in ds:
