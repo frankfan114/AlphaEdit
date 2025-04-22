@@ -1,8 +1,5 @@
 import sys
 import json
-
-sys.path.append('/data/christinefang/unified-model-editing')
-
 from glue_eval.sst_eval import SSTEval
 from glue_eval.mrpc_eval import MRPCEval
 from glue_eval.cola_eval import COLAEval
