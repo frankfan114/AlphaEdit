@@ -49,7 +49,7 @@ results/
         |__ case_0.json
         |__ case_1.json
         |__ ...
-        |__ case_10000.json
+        |__ case_2000.json
 ```
 
 #### 2. Summarize the results  
