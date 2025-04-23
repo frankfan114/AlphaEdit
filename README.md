@@ -58,4 +58,4 @@ To summarize the results, you can use [`experiments/summarize.py`](experiments/s
     python summarize.py --dir_name=AlphaEdit --runs=run_<run1>,run_<run2>
 
 ## Acknowledgment
-Our code is based on  [``MEMIT``](https://github.com/kmeng01/memit.git) adn [``EMMET``](https://github.com/scalable-model-editing/unified-model-editing.git).
+Our code is based on  [``MEMIT``](https://github.com/kmeng01/memit.git) and [``EMMET``](https://github.com/scalable-model-editing/unified-model-editing.git).
