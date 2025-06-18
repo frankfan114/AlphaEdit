@@ -14,7 +14,7 @@
 - einops==0.4.0
 - higher==0.2.1
 - hydra-core==1.2.0
-- transformers==4.23.1
+- transformers==4.30.1
 - datasets==1.18.3
 - matplotlib==3.6.1
 - spacy==3.4.1
