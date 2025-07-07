@@ -10,17 +10,17 @@
 ## Requirements
 **At least one A40 48G GPU.**
 
-- pytorch==1.12.1
-- einops==0.4.0
+- torch==2.6.0
+- einops==0.8.1
 - higher==0.2.1
-- hydra-core==1.2.0
-- transformers==4.30.1
-- datasets==1.18.3
-- matplotlib==3.6.1
+- hydra-core==1.3.2
+- transformers==4.51.3
+- datasets==2.21.0
+- matplotlib==3.10.3
 - spacy==3.4.1
-- scipy==1.9.2
-- scikit-learn==1.0.2
-- nltk==3.7
+- scipy==1.15.2
+- scikit-learn==1.6.1
+- nltk==3.9.1
 
 We directly provide the "cov" matrix of Llama3-8B-instruct that we have already calculated. [https://drive.google.com/file/d/1GhDb4vPd1NIyRCbbIlgXV45xbE2UQMav/view?usp=sharing](https://drive.google.com/file/d/1rAeGBJccEaZYFpPMlD5tb5TNjkaUqwq6/view?usp=drive_link)
 After decompressing it and saving it to the "./data/stats" folder.
