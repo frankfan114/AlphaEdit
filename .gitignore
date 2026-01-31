@@ -1,0 +1,10 @@
+results/
+
+__pycache__/
+
+edited_model/
+
+data/
+
+.venv-alphaedit/
+

@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import json
 import shutil
 from itertools import islice
@@ -69,6 +69,7 @@ def main(
     dir_name: str,
     num_edits: int = 1,
     use_cache: bool = False,
+    args = None,
 ):
     # Set algorithm-specific variables
     params_class, apply_algo = ALG_DICT[alg_name]
@@ -97,19 +98,52 @@ def main(
     if "MEMIT" in alg_name:
     # Get run hyperparameters
         params_path = (
-            run_dir / "params.json"
+            run_dir / "0_params.json"
             if continue_from_run is not None
             else HPARAMS_DIR / "MEMIT" / hparams_fname
         )
     else:
         params_path = (
-            run_dir / "params.json"
+            run_dir / "0_params.json"
             if continue_from_run is not None
             else HPARAMS_DIR / alg_name / hparams_fname
         )
     hparams = params_class.from_json(params_path)
-    if not (run_dir / "params.json").exists():
-        shutil.copyfile(params_path, run_dir / "params.json")
+    
+    
+    # if not (run_dir / "0_params.json").exists():
+    #     shutil.copyfile(params_path, run_dir / "0_params.json")
+    if not (run_dir / "0_params.json").exists():
+        # 1. 读取原始 hparams json
+        with open(params_path, "r") as f:
+            hparams_dict = json.load(f)
+
+        # 2. 组织运行参数（bench / dataset / edits 等）
+        run_args = {
+            "alg_name": alg_name,
+            "model_name": model_name,
+            "ds_name": ds_name,
+            "dataset_size_limit": dataset_size_limit,
+            "num_edits": num_edits,
+            "use_cache": use_cache,
+            "skip_generation_tests": skip_generation_tests,
+            "generation_test_interval": generation_test_interval,
+            "conserve_memory": conserve_memory,
+            "continue_from_run": continue_from_run,
+            "downstream_eval_steps": args.downstream_eval_steps if args is not None else None,
+        }
+
+        # 3. 合并成一个实验配置快照
+        full_params = {
+            "hparams": hparams_dict,
+            "run_args": run_args,
+        }
+
+        # 4. 写入 run_dir/0_params.json
+        with open(run_dir / "0_params.json", "w") as f:
+            json.dump(full_params, f, indent=2)
+
+    
     print(f"Executing {alg_name} with parameters {hparams}")
 
     # Instantiate vanilla model
@@ -413,6 +447,8 @@ def main(
                 ),  # Only test generation every generation_test_interval cases
             ),
         }
+        
+        
         # Dump metrics in .json
         with open(out_file, "w") as f:
             json.dump(metrics, f, indent=1)
@@ -423,6 +459,16 @@ def main(
         #         nethook.get_parameter(model, k)[...] = v.to("cuda")
 
         print("Evaluation took", time() - start)
+    
+    save_dir = run_dir / "final_model"
+    edited_model.save_pretrained(save_dir)
+    tok.save_pretrained(save_dir)
+
+    
+    
+    
+    
+    
 def get_project(model, tok, layer, hparams):
     force_recompute = False
     cov = get_cov(
@@ -557,4 +603,5 @@ if __name__ == "__main__":
         dir_name=args.alg_name,
         num_edits=args.num_edits,
         use_cache=args.use_cache,
+        args =args,
     )

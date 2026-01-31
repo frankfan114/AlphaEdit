@@ -40,23 +40,35 @@ def main():
     aa(
         "--model_name",
         default="gpt2-xl",
-        choices=[
-            "gpt2-xl",
-            "EleutherAI/gpt-j-6B",
-            "EleutherAI/gpt-neox-20b",
-            "gpt2-large",
-            "gpt2-medium",
-            "gpt2",
-        ],
+        # choices=[
+        #     "gpt2-xl",
+        #     "EleutherAI/gpt-j-6B",
+        #     "EleutherAI/gpt-neox-20b",
+        #     "gpt2-large",
+        #     "gpt2-medium",
+        #     "gpt2",
+        # ],
     )
     aa("--fact_file", default=None)
     aa("--output_dir", default="results/{model_name}/causal_trace")
     aa("--noise_level", default="s3", type=parse_noise_rule)
     aa("--replace", default=0, type=int)
     args = parser.parse_args()
+    
+    model_name_or_path = args.model_name
+    is_local_path = os.path.isdir(model_name_or_path)
 
-    modeldir = f'r{args.replace}_{args.model_name.replace("/", "_")}'
+    # modeldir = f'r{args.replace}_{args.model_name.replace("/", "_")}'
+    # modeldir = f"n{args.noise_level}_" + modeldir
+        
+    if is_local_path:
+        model_tag = os.path.basename(os.path.abspath(model_name_or_path))
+    else:
+        model_tag = model_name_or_path.replace("/", "_")
+
+    modeldir = f"r{args.replace}_{model_tag}"
     modeldir = f"n{args.noise_level}_" + modeldir
+
     output_dir = args.output_dir.format(model_name=modeldir)
     result_dir = f"{output_dir}/cases"
     pdf_dir = f"{output_dir}/pdfs"
@@ -65,14 +77,35 @@ def main():
 
     # Half precision to let the 20b model fit.
     torch_dtype = torch.float16 if "20b" in args.model_name else None
+    
+    
 
-    mt = ModelAndTokenizer(args.model_name, torch_dtype=torch_dtype)
+    mt = ModelAndTokenizer(model_name_or_path, torch_dtype=torch_dtype)
 
     if args.fact_file is None:
         knowns = KnownsDataset(DATA_DIR)
+
+    elif "counterfact" in args.fact_file.lower():
+
+        with open(args.fact_file) as f:
+            raw_cases = json.load(f)
+
+        knowns = []
+        for case in raw_cases:
+            rr = case["requested_rewrite"]
+            subject = rr["subject"]
+            prompt = rr["prompt"].format(subject)
+            attribute = rr["target_true"]["str"]  # causal trace 用真值
+            knowns.append({
+                "known_id": case["case_id"],
+                "prompt": prompt,
+                "subject": subject,
+                "attribute": attribute,
+            })
     else:
         with open(args.fact_file) as f:
-            knowns = json.load(f)
+            knowns = json.load(f)        
+            
 
     noise_level = args.noise_level
     uniform_noise = False
@@ -119,13 +152,22 @@ def main():
                 numpy.savez(filename, **numpy_result)
             else:
                 numpy_result = numpy.load(filename, allow_pickle=True)
+
+            # if not numpy_result["correct_prediction"]:
+            #     tqdm.write(f"Skipping {knowledge['prompt']}, {numpy_result['actual_result']} ")
+            #     continue
+            
             if not numpy_result["correct_prediction"]:
-                tqdm.write(f"Skipping {knowledge['prompt']}")
+                reason = "subject_not_found" if "subject_not_found" in numpy_result else "wrong_prediction"
+                tqdm.write(
+                    f"[{reason}] Skipping {knowledge['prompt']}, pred={numpy_result['actual_result']}"
+                )
                 continue
+
             plot_result = dict(numpy_result)
             plot_result["kind"] = kind
             pdfname = f'{pdf_dir}/{str(numpy_result["answer"]).strip()}_{known_id}{kind_suffix}.pdf'
-            if known_id > 200:
+            if known_id > 2000:
                 continue
             plot_trace_heatmap(plot_result, savepdf=pdfname)
 
@@ -317,8 +359,19 @@ def calculate_hidden_flow(
         answer_t, base_score = [d[0] for d in predict_from_input(mt.model, inp)]
     [answer] = decode_tokens(mt.tokenizer, [answer_t])
     if expect is not None and answer.strip() != expect:
-        return dict(correct_prediction=False)
-    e_range = find_token_range(mt.tokenizer, inp["input_ids"][0], subject)
+        return dict(
+            correct_prediction=False,
+            actual_result=answer.strip(),
+            )
+    try:
+        e_range = find_token_range(mt.tokenizer, inp["input_ids"][0], subject)
+    except ValueError:
+        return dict(
+            correct_prediction=False,
+            actual_result=answer.strip(),
+            subject_not_found=True,
+        )
+
     if token_range == "subject_last":
         token_range = [e_range[1] - 1]
     elif token_range is not None:
@@ -545,7 +598,7 @@ def plot_trace_heatmap(result, savepdf=None, title=None, xlabel=None, modelname=
     for i in range(*result["subject_range"]):
         labels[i] = labels[i] + "*"
 
-    with plt.rc_context(rc={"font.family": "Times New Roman"}):
+    with plt.rc_context(rc={"font.family": "DejaVu Serif"}):
         fig, ax = plt.subplots(figsize=(3.5, 2), dpi=200)
         h = ax.pcolor(
             differences,
@@ -665,7 +718,8 @@ def get_embedding_cov(mt):
         ds_name = "wikitext"
         raw_ds = load_dataset(
             ds_name,
-            dict(wikitext="wikitext-103-raw-v1", wikipedia="20200501.en")[ds_name],
+            dict(wikitext="wikitext-103-raw-v1", wikipedia="20220301.en")[ds_name],
+            trust_remote_code=True,
         )
         try:
             maxlen = model.config.n_positions
