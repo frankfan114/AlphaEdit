@@ -445,7 +445,7 @@ def plot_trace_heatmap(result, savepdf=None, title=None, xlabel=None, modelname=
     for i in range(*result["subject_range"]):
         labels[i] = labels[i] + "*"
 
-    with plt.rc_context(rc={"font.family": "Times New Roman"}):
+    with plt.rc_context(rc={"font.family": "DejaVu Serif"}):
         fig, ax = plt.subplots(figsize=(3.8, 2.2), dpi=220)
         h = ax.pcolor(
             differences,

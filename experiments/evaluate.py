@@ -30,6 +30,18 @@ from memit.memit_seq_main import apply_memit_seq_to_model
 from memit.memit_rect_main import apply_memit_rect_to_model
 from AlphaEdit import AlphaEditHyperParams
 from AlphaEdit.AlphaEdit_main import apply_AlphaEdit_to_model, get_cov
+from AlphaEdit.AlphaEdit_main_delta_fro import apply_AlphaEdit_delta_fro_to_model
+from AlphaEdit.AlphaEdit_main_delta_spectral import apply_AlphaEdit_delta_spectral_to_model
+from AlphaEdit.analysis_tools import (
+    aggregate_probe_metrics,
+    clone_rewrite_weights,
+    compute_conflict_metrics_for_record,
+    select_history_probe,
+    select_history_probe_oldest,
+    select_history_probe_recent,
+    select_history_probe_stratified,
+    summarize_rewrite_weight_metrics,
+)
 from rome import ROMEHyperParams, apply_rome_to_model
 from util import nethook
 from util.globals import *
@@ -38,6 +50,8 @@ from nse.nse_main import apply_nse_to_model
 from glue_eval.glue_eval import GLUEEval
 ALG_DICT = {
     "AlphaEdit": (AlphaEditHyperParams, apply_AlphaEdit_to_model),
+    "AlphaEditDeltaFro": (AlphaEditHyperParams, apply_AlphaEdit_delta_fro_to_model),
+    "AlphaEditDeltaSpectral": (AlphaEditHyperParams, apply_AlphaEdit_delta_spectral_to_model),
     "MEMIT_seq": (MEMITHyperParams, apply_memit_seq_to_model),
     "MEMIT_prune": (MEMITHyperParams, apply_memit_to_model),
     "MEMIT_rect": (MEMITHyperParams, apply_memit_rect_to_model),
@@ -54,6 +68,25 @@ DS_DICT = {
     "zsre": (MENDQADataset, compute_rewrite_quality_zsre),
     "mquake": (MQUAKEDataset, compute_rewrite_quality_mquake),
 }
+
+
+def evaluate_record_list(model, tok, records, ds_eval_method):
+    case_metrics = []
+    for record in records:
+        post_metrics = ds_eval_method(model, tok, record, None, None)
+        case_metrics.append(
+            {
+                "case_id": record["case_id"],
+                "post": post_metrics,
+                "conflict_metrics": compute_conflict_metrics_for_record(model, tok, record),
+            }
+        )
+
+    return {
+        "case_ids": [record["case_id"] for record in records],
+        "summary": aggregate_probe_metrics(case_metrics),
+        "cases": case_metrics,
+    }
 
 
 def main(
@@ -76,10 +109,10 @@ def main(
 
     # Determine run directory
     # Create new dir if not continuing from prev run OR prev run doesn't exist
-    if (
-        continue_from_run is None
-        or not (run_dir := RESULTS_DIR / dir_name / continue_from_run).exists()
-    ):
+    run_dir = None
+    if continue_from_run is not None:
+        run_dir = RESULTS_DIR / dir_name / continue_from_run
+    if continue_from_run is None or not run_dir.exists():
         continue_from_run = None
     if continue_from_run is None:
         alg_dir = RESULTS_DIR / dir_name
@@ -109,6 +142,18 @@ def main(
             else HPARAMS_DIR / alg_name / hparams_fname
         )
     hparams = params_class.from_json(params_path)
+    if alg_name in ("AlphaEdit", "AlphaEditDeltaFro", "AlphaEditDeltaSpectral") and args is not None:
+        hparams.numerical_stability = args.numerical_stability
+        hparams.stability_spectral_multiplier = args.stability_spectral_multiplier
+        hparams.stability_condition_number = args.stability_condition_number
+        hparams.stability_fro_drift_ratio = args.stability_fro_drift_ratio
+        hparams.knowledge_conflict = args.knowledge_conflict
+        hparams.conflict_loss_weight = args.conflict_loss_weight
+        hparams.conflict_margin = args.conflict_margin
+        hparams.analysis_top_singular_values = args.analysis_top_singular_values
+        hparams.delta_fro_tau = args.delta_fro_tau
+        hparams.delta_fro_ratio = args.delta_fro_ratio
+        hparams.delta_spectral_tau = args.delta_spectral_tau
     
     
     # if not (run_dir / "0_params.json").exists():
@@ -131,6 +176,16 @@ def main(
             "conserve_memory": conserve_memory,
             "continue_from_run": continue_from_run,
             "downstream_eval_steps": args.downstream_eval_steps if args is not None else None,
+            "analysis_interval": args.analysis_interval if args is not None else None,
+            "history_probe_size": args.history_probe_size if args is not None else None,
+            "numerical_stability": args.numerical_stability if args is not None else None,
+            "stability_spectral_multiplier": args.stability_spectral_multiplier if args is not None else None,
+            "stability_condition_number": args.stability_condition_number if args is not None else None,
+            "stability_fro_drift_ratio": args.stability_fro_drift_ratio if args is not None else None,
+            "knowledge_conflict": args.knowledge_conflict if args is not None else None,
+            "conflict_loss_weight": args.conflict_loss_weight if args is not None else None,
+            "conflict_margin": args.conflict_margin if args is not None else None,
+            "analysis_top_singular_values": args.analysis_top_singular_values if args is not None else None,
         }
 
         # 3. 合并成一个实验配置快照
@@ -240,7 +295,10 @@ def main(
     if alg_name == "AlphaEdit":
         for i, layer in enumerate(hparams.layers):
             P[i,:,:] = get_project(model,tok,layer,hparams)
-        torch.save(P, "null_space_project.pt")
+        torch.save(P, run_dir / "null_space_project.pt")
+        weight_reference = clone_rewrite_weights(model, hparams)
+    else:
+        weight_reference = None
     # hs = get_module_input_output_at_words(
     #         model,
     #         tok,
@@ -254,6 +312,22 @@ def main(
     # del hs
     glue_save_location = str(run_dir) + '/' + 'glue_eval/'
     os.makedirs(glue_save_location, exist_ok=True)
+    round_save_dir = run_dir / "sequential_rounds"
+    round_save_dir.mkdir(exist_ok=True)
+    edited_history = []
+    if alg_name == "AlphaEdit":
+        with open(round_save_dir / "round_0000.json", "w") as f:
+            json.dump(
+                {
+                    "round_idx": 0,
+                    "edits_applied": 0,
+                    "weight_metrics": summarize_rewrite_weight_metrics(
+                        model, hparams, weight_reference
+                    ),
+                },
+                f,
+                indent=2,
+            )
     cnt = 0
     for record_chunks in chunks(ds, num_edits):
         case_result_template = str(run_dir / "{}_edits-case_{}.json")
@@ -279,6 +353,7 @@ def main(
         etc_args = dict(cache_template=cache_template) if any(alg in alg_name for alg in ["ROME", "MEMIT","AlphaEdit", "MEMIT_seq", "MEMIT_prune", "NSE"]) else dict()
         seq_args = dict(cache_c=cache_c) if any(alg in alg_name for alg in ["AlphaEdit", "MEMIT_seq", "NSE"]) else dict()
         nc_args = dict(P = P) if any(alg in alg_name for alg in ["AlphaEdit"]) else dict()
+        stability_args = dict(weight_reference=weight_reference) if alg_name == "AlphaEdit" else dict()
         if cnt == 0 and args.downstream_eval_steps > 0:#do initial GLUE EVAL WITH ORIGINAL MODEL
             glue_results = {'edit_num': -1}
 
@@ -292,7 +367,28 @@ def main(
             with open(output_filename, "w") as f:
                 json.dump(glue_results, f, indent=4)
         start = time()
-        if any(alg in alg_name for alg in ["AlphaEdit", "MEMIT_seq", "NSE"]):
+        round_edit_diagnostics = None
+        if alg_name == "AlphaEdit":
+            edited_model, cache_c, round_edit_diagnostics = apply_algo(
+                model,
+                tok,
+                [
+                    {"case_id": record["case_id"], **rewrite_dict}
+                    for record in record_chunks
+                    for rewrite_dict in (
+                        record["requested_rewrite"]
+                        if isinstance(record["requested_rewrite"], list)
+                        else [record["requested_rewrite"]]
+                    )
+                ],
+                hparams,
+                **args_conserve_memory,
+                **etc_args,
+                **seq_args,
+                **nc_args,
+                **stability_args,
+            )
+        elif any(alg in alg_name for alg in ["MEMIT_seq", "NSE"]):
             edited_model, cache_c = apply_algo(
                 model,
                 tok,
@@ -395,9 +491,11 @@ def main(
             )
         exec_time = time() - start
         cnt+=1
+        edited_history.extend(record_chunks)
         print("Execution took", exec_time)
         # Evaluate new model
-    
+
+        round_glue_results = None
         if args.downstream_eval_steps > 0 and cnt % args.downstream_eval_steps == 0:
             glue_results = {
                         'edit_num': cnt*num_edits,
@@ -413,6 +511,51 @@ def main(
             output_filename = out_file.replace('.json', '_glue.json')
             with open(output_filename, "w") as f:
                 json.dump(glue_results, f, indent=4)
+            round_glue_results = glue_results
+
+        if alg_name == "AlphaEdit" and args.analysis_interval > 0 and cnt % args.analysis_interval == 0:
+            # --- multi-strategy history probing ---
+            probe_random   = select_history_probe(edited_history, args.history_probe_size)
+            probe_oldest   = select_history_probe_oldest(edited_history, args.history_probe_size)
+            probe_recent   = select_history_probe_recent(edited_history, args.history_probe_size)
+            probe_strata   = select_history_probe_stratified(edited_history, args.history_probe_size)
+
+            stratified_eval = {
+                stratum: evaluate_record_list(model, tok, records, ds_eval_method)
+                for stratum, records in probe_strata.items()
+                if records
+            }
+
+            round_payload = {
+                "round_idx": cnt,
+                "edits_applied": cnt * num_edits,
+                "chunk_case_ids": [record["case_id"] for record in record_chunks],
+                "edit_time": exec_time,
+                "update_diagnostics": round_edit_diagnostics,
+                "weight_metrics": summarize_rewrite_weight_metrics(
+                    model, hparams, weight_reference
+                ),
+                "current_batch_eval": evaluate_record_list(
+                    model, tok, record_chunks, ds_eval_method
+                ),
+                "history_probe_eval": evaluate_record_list(
+                    model, tok, probe_random, ds_eval_method
+                ),
+                "history_probe_oldest_eval": evaluate_record_list(
+                    model, tok, probe_oldest, ds_eval_method
+                ),
+                "history_probe_recent_eval": evaluate_record_list(
+                    model, tok, probe_recent, ds_eval_method
+                ),
+                "history_probe_stratified_eval": stratified_eval,
+            }
+            round_payload["immediate_current_batch_edit_success"] = (
+                round_payload["current_batch_eval"]["summary"]["edit_success"]
+            )
+            if round_glue_results is not None:
+                round_payload["downstream_eval"] = round_glue_results
+            with open(round_save_dir / f"round_{cnt:04d}.json", "w") as f:
+                json.dump(round_payload, f, indent=2)
     # hs = get_module_input_output_at_words(
     #         edited_model,
     #         tok,
@@ -436,6 +579,9 @@ def main(
             "num_edits": num_edits,
             "requested_rewrite": record["requested_rewrite"],
             "time": exec_time,
+            "conflict_metrics": compute_conflict_metrics_for_record(
+                edited_model, tok, record
+            ),
             "post": ds_eval_method(
                 edited_model,
                 tok,
@@ -586,6 +732,84 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="If we want to do sequential editing or not",
+    )
+    parser.add_argument(
+        "--analysis_interval",
+        type=int,
+        default=1,
+        help="Save round-level sequential diagnostics every N edit rounds.",
+    )
+    parser.add_argument(
+        "--history_probe_size",
+        type=int,
+        default=32,
+        help="How many edited cases to reevaluate for retention/locality diagnostics.",
+    )
+    parser.add_argument(
+        "--analysis_top_singular_values",
+        type=int,
+        default=8,
+        help="How many leading/trailing singular values to store per edited layer.",
+    )
+    parser.add_argument(
+        "--numerical_stability",
+        choices=["none", "svd_clip"],
+        default="none",
+        help="Post-edit numerical stability intervention for AlphaEdit.",
+    )
+    parser.add_argument(
+        "--stability_spectral_multiplier",
+        type=float,
+        default=0.0,
+        help="Cap edited-layer spectral norm to this multiple of the pre-edit reference.",
+    )
+    parser.add_argument(
+        "--stability_condition_number",
+        type=float,
+        default=0.0,
+        help="Cap edited-layer condition number by lifting small singular values after each edit.",
+    )
+    parser.add_argument(
+        "--stability_fro_drift_ratio",
+        type=float,
+        default=0.0,
+        help="Cap Frobenius drift relative to the original edited weight matrix.",
+    )
+    parser.add_argument(
+        "--delta_fro_tau",
+        type=float,
+        default=0.0,
+        help="AlphaEditDeltaFro: absolute Frobenius threshold τ_F for ΔW clipping. 0 = use --delta_fro_ratio.",
+    )
+    parser.add_argument(
+        "--delta_fro_ratio",
+        type=float,
+        default=0.0,
+        help="AlphaEditDeltaFro: τ_F = ratio * ||W0||_F. Used when --delta_fro_tau is 0. 0 = disabled.",
+    )
+    parser.add_argument(
+        "--delta_spectral_tau",
+        type=float,
+        default=0.0,
+        help="AlphaEditDeltaSpectral: spectral-norm threshold τ_2 for ΔW clipping. 0 = disabled.",
+    )
+    parser.add_argument(
+        "--knowledge_conflict",
+        choices=["none", "old_target_margin"],
+        default="none",
+        help="Conflict intervention used inside compute_z for AlphaEdit.",
+    )
+    parser.add_argument(
+        "--conflict_loss_weight",
+        type=float,
+        default=0.0,
+        help="Weight on the old-vs-new target margin loss.",
+    )
+    parser.add_argument(
+        "--conflict_margin",
+        type=float,
+        default=0.0,
+        help="Desired margin between new-target and old-target sequence losses.",
     )
     parser.set_defaults(skip_generation_tests=False, conserve_memory=False)
     args = parser.parse_args()

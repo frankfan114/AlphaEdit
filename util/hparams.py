@@ -13,4 +13,7 @@ class HyperParams:
         with open(fpath, "r") as f:
             data = json.load(f)
 
+        if "hparams" in data and isinstance(data["hparams"], dict):
+            data = data["hparams"]
+
         return cls(**data)

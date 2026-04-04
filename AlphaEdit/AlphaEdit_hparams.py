@@ -36,3 +36,16 @@ class AlphaEditHyperParams(HyperParams):
     mom2_dtype: str
     nullspace_threshold: float
     L2: float
+    numerical_stability: str = "none"
+    stability_spectral_multiplier: float = 0.0
+    stability_condition_number: float = 0.0
+    stability_fro_drift_ratio: float = 0.0
+    knowledge_conflict: str = "none"
+    conflict_loss_weight: float = 0.0
+    conflict_margin: float = 0.0
+    analysis_top_singular_values: int = 8
+    # Delta-level Frobenius clipping (AlphaEditDeltaFro)
+    delta_fro_tau: float = 0.0        # absolute threshold; 0 = use ratio
+    delta_fro_ratio: float = 0.0      # tau_F = ratio * ||W0||_F; 0 = disabled
+    # Delta-level Spectral clipping (AlphaEditDeltaSpectral)
+    delta_spectral_tau: float = 0.0   # absolute threshold; 0 = disabled

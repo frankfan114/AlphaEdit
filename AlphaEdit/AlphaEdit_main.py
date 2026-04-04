@@ -15,6 +15,7 @@ from util.globals import *
 from .compute_ks import compute_ks
 from .compute_z import compute_z, get_module_input_output_at_words, find_fact_lookup_idx
 from .AlphaEdit_hparams import AlphaEditHyperParams
+from .analysis_tools import apply_stability_projection_
 # Cache variable(s)
 CONTEXT_TEMPLATES_CACHE = None
 COV_CACHE = {}
@@ -27,11 +28,14 @@ def apply_AlphaEdit_to_model(
     cache_template: Optional[str] = None,
     cache_c = None,
     P = None,
+    weight_reference = None,
 ) -> Dict[str, Tuple[torch.Tensor]]:
     """
     Executes the MEMIT update algorithm for the specified update at the specified layer
     Invariant: model at beginning of function == model at end of function
     """
+
+    edit_diagnostics = {"layers": {}, "aggregate": {}}
 
     # Update target and print info
     requests = deepcopy(requests)
@@ -133,10 +137,49 @@ def apply_AlphaEdit_to_model(
         # Adjust update matrix shape
         weight_name = f"{hparams.rewrite_module_tmp.format(layer)}.weight"
         upd_matrix = upd_matrix_match_shape(upd_matrix, weights[weight_name].shape)
-        print("orig norm", torch.linalg.norm(weights[weight_name]))
-        print("upd norm", torch.linalg.norm(upd_matrix))
+        orig_norm = torch.linalg.norm(weights[weight_name]).item()
+
+        # ── Exact ΔW diagnostics (computed before applying the update) ──────
+        upd_float = upd_matrix.detach().float().cpu()
+        delta_fro      = torch.linalg.norm(upd_float, ord="fro").item()
+        delta_spectral = torch.linalg.norm(upd_float, ord=2).item()
+        delta_stable_rank = (delta_fro ** 2) / (delta_spectral ** 2 + 1e-12)
+        upd_norm = delta_fro   # keep existing variable name for downstream code
+        print("orig norm", orig_norm)
+        print(f"upd norm  ||ΔW||_F={delta_fro:.4f}  ||ΔW||_2={delta_spectral:.4f}  stable_rank(ΔW)={delta_stable_rank:.2f}")
+        # ────────────────────────────────────────────────────────────────────
+
         with torch.no_grad():
             weights[weight_name][...] = weights[weight_name] + upd_matrix
+        projection_info = {
+            "applied": False,
+            "pre_projection_delta_norm": None,
+            "post_projection_delta_norm": None,
+            "spectral_upper_bound": None,
+            "condition_lower_bound": None,
+        }
+        if weight_reference is not None:
+            projection_info = apply_stability_projection_(
+                weights[weight_name], weight_reference[weight_name], hparams
+            )
+            if projection_info.get("applied"):
+                print(
+                    f"Applied numerical stability projection to {weight_name}: {projection_info}"
+                )
+        edit_diagnostics["layers"][str(layer)] = {
+            "weight_name": weight_name,
+            "orig_norm": orig_norm,
+            "update_norm": upd_norm,
+            "update_to_orig_norm_ratio": float(upd_norm / (orig_norm + 1e-12)),
+            "delta_fro": delta_fro,
+            "delta_spectral": delta_spectral,
+            "delta_stable_rank": delta_stable_rank,
+            "pre_projection_delta_norm": projection_info.get("pre_projection_delta_norm"),
+            "post_projection_delta_norm": projection_info.get("post_projection_delta_norm"),
+            "projection_applied": projection_info.get("applied", False),
+            "spectral_upper_bound": projection_info.get("spectral_upper_bound"),
+            "condition_lower_bound": projection_info.get("condition_lower_bound"),
+        }
         # Clear GPU memory
         #del U,S,cov
         for x in [layer_ks, cur_zs, targets, upd_matrix]:
@@ -147,8 +190,53 @@ def apply_AlphaEdit_to_model(
         layer_ks = compute_ks(model, tok, requests, hparams, layer, context_templates).T
         cache_c[i,:,:] += layer_ks.cpu() @ layer_ks.cpu().T
 
+    layer_metrics = list(edit_diagnostics["layers"].values())
+    if len(layer_metrics) > 0:
+        edit_diagnostics["aggregate"] = {
+            "mean_update_norm": float(
+                sum(metric["update_norm"] for metric in layer_metrics) / len(layer_metrics)
+            ),
+            "mean_update_to_orig_norm_ratio": float(
+                sum(metric["update_to_orig_norm_ratio"] for metric in layer_metrics)
+                / len(layer_metrics)
+            ),
+            "mean_pre_projection_delta_norm": float(
+                sum(
+                    metric["pre_projection_delta_norm"]
+                    for metric in layer_metrics
+                    if metric["pre_projection_delta_norm"] is not None
+                )
+                / max(
+                    sum(
+                        1
+                        for metric in layer_metrics
+                        if metric["pre_projection_delta_norm"] is not None
+                    ),
+                    1,
+                )
+            ),
+            "mean_post_projection_delta_norm": float(
+                sum(
+                    metric["post_projection_delta_norm"]
+                    for metric in layer_metrics
+                    if metric["post_projection_delta_norm"] is not None
+                )
+                / max(
+                    sum(
+                        1
+                        for metric in layer_metrics
+                        if metric["post_projection_delta_norm"] is not None
+                    ),
+                    1,
+                )
+            ),
+            "projection_applied_layers": int(
+                sum(1 for metric in layer_metrics if metric["projection_applied"])
+            ),
+        }
+
     print(f"Deltas successfully computed for {list(weights.keys())}")
-    return model, cache_c
+    return model, cache_c, edit_diagnostics
 
 
 def get_cov(

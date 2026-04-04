@@ -8,3 +8,10 @@ data/
 
 .venv-alphaedit/
 
+*.txt
+
+*.csv
+
+*.json
+
+*.png
