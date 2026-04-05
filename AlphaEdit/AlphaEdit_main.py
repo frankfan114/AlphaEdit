@@ -16,6 +16,12 @@ from .compute_ks import compute_ks
 from .compute_z import compute_z, get_module_input_output_at_words, find_fact_lookup_idx
 from .AlphaEdit_hparams import AlphaEditHyperParams
 from .analysis_tools import apply_stability_projection_
+from .delta_clipping import clip_delta_frobenius, clip_delta_spectral
+from .diagnostics import (
+    compute_conflict_sub,
+    compute_block_ratio,
+    protected_rank_from_projector,
+)
 # Cache variable(s)
 CONTEXT_TEMPLATES_CACHE = None
 COV_CACHE = {}
@@ -29,6 +35,7 @@ def apply_AlphaEdit_to_model(
     cache_c = None,
     P = None,
     weight_reference = None,
+    enable_diagnostics: bool = False,
 ) -> Dict[str, Tuple[torch.Tensor]]:
     """
     Executes the MEMIT update algorithm for the specified update at the specified layer
@@ -139,12 +146,34 @@ def apply_AlphaEdit_to_model(
         upd_matrix = upd_matrix_match_shape(upd_matrix, weights[weight_name].shape)
         orig_norm = torch.linalg.norm(weights[weight_name]).item()
 
-        # ── Exact ΔW diagnostics (computed before applying the update) ──────
+        # ── Delta-level clipping (optional, controlled by hparams) ──────────
+        clip_info = {"clipped": False, "scale": 1.0}
+        if getattr(hparams, "delta_spectral_tau", 0.0) > 0.0:
+            clip_info = clip_delta_spectral(upd_matrix, hparams.delta_spectral_tau)
+            upd_matrix = clip_info["clipped_delta"].to(upd_matrix.device, dtype=upd_matrix.dtype)
+            if clip_info["clipped"]:
+                print(f"  Spectral clip: scale={clip_info['scale']:.4f}, "
+                      f"pre={clip_info['pre_clip_spectral']:.4f}, post={clip_info['post_clip_spectral']:.4f}")
+        else:
+            tau_f = getattr(hparams, "delta_fro_tau", 0.0)
+            if tau_f <= 0.0 and getattr(hparams, "delta_fro_ratio", 0.0) > 0.0 and weight_reference is not None:
+                tau_f = hparams.delta_fro_ratio * torch.linalg.norm(
+                    weight_reference[weight_name].float(), ord="fro"
+                ).item()
+            if tau_f > 0.0:
+                clip_info = clip_delta_frobenius(upd_matrix, tau_f)
+                upd_matrix = clip_info["clipped_delta"].to(upd_matrix.device, dtype=upd_matrix.dtype)
+                if clip_info["clipped"]:
+                    print(f"  Frobenius clip: scale={clip_info['scale']:.4f}, "
+                          f"pre={clip_info['pre_clip_norm']:.4f}, post={clip_info['post_clip_norm']:.4f}")
+        # ────────────────────────────────────────────────────────────────────
+
+        # ── Exact ΔW diagnostics (computed after clipping, before applying) ─
         upd_float = upd_matrix.detach().float().cpu()
         delta_fro      = torch.linalg.norm(upd_float, ord="fro").item()
         delta_spectral = torch.linalg.norm(upd_float, ord=2).item()
         delta_stable_rank = (delta_fro ** 2) / (delta_spectral ** 2 + 1e-12)
-        upd_norm = delta_fro   # keep existing variable name for downstream code
+        upd_norm = delta_fro
         print("orig norm", orig_norm)
         print(f"upd norm  ||ΔW||_F={delta_fro:.4f}  ||ΔW||_2={delta_spectral:.4f}  stable_rank(ΔW)={delta_stable_rank:.2f}")
         # ────────────────────────────────────────────────────────────────────
@@ -166,7 +195,7 @@ def apply_AlphaEdit_to_model(
                 print(
                     f"Applied numerical stability projection to {weight_name}: {projection_info}"
                 )
-        edit_diagnostics["layers"][str(layer)] = {
+        layer_diag = {
             "weight_name": weight_name,
             "orig_norm": orig_norm,
             "update_norm": upd_norm,
@@ -180,6 +209,50 @@ def apply_AlphaEdit_to_model(
             "spectral_upper_bound": projection_info.get("spectral_upper_bound"),
             "condition_lower_bound": projection_info.get("condition_lower_bound"),
         }
+
+        # ── Mechanism-analysis diagnostics (enabled via enable_diagnostics) ──
+        # These quantities are computed using the SAME layer_ks / resid / cache_c
+        # that drove the actual update.  They add one extra linear solve per layer
+        # but do NOT change any model weights or accumulators.
+        if enable_diagnostics and P is not None:
+            P_i = P[i, :, :].cuda()
+
+            # conflict_sub(t) = ‖P k_t‖² / ‖k_t‖²
+            # Measures how much of the edit key lives in the protected null-space.
+            # Uses the FIXED initial projector P (AlphaEdit never updates P).
+            conflict_info = compute_conflict_sub(layer_ks, P_i)
+
+            # block_ratio(t) = ‖Δ_block‖_F / ‖Δ_raw‖_F
+            # Δ_raw is the MEMIT-style update (no null-space constraint).
+            # Δ_block = (I − P) @ Δ_raw  (LEFT mult on key dimension).
+            block_info = compute_block_ratio(
+                layer_ks,
+                resid,
+                cache_c[i, :, :],
+                P_i,
+                hparams.L2,
+            )
+
+            p_rank = protected_rank_from_projector(P_i)
+            layer_diag.update({
+                # conflict_sub(t)
+                "conflict_sub":    conflict_info["conflict_sub"],
+                "k_t_norm":        conflict_info["k_t_norm"],
+                # block_ratio(t)
+                "block_ratio":     block_info["block_ratio"],
+                "delta_raw_fro":   block_info["delta_raw_fro"],
+                "delta_allow_fro": block_info["delta_allow_fro"],
+                "delta_block_fro": block_info["delta_block_fro"],
+                "diag_solve_failed": block_info["solve_failed"],
+                # subspace structure
+                "protected_rank":  p_rank,
+                "total_dim":       P_i.shape[0],
+                "free_rank_proxy": P_i.shape[0] - p_rank,
+            })
+
+        edit_diagnostics["layers"][str(layer)] = layer_diag
+        # ─────────────────────────────────────────────────────────────────────
+
         # Clear GPU memory
         #del U,S,cov
         for x in [layer_ks, cur_zs, targets, upd_matrix]:
@@ -192,7 +265,7 @@ def apply_AlphaEdit_to_model(
 
     layer_metrics = list(edit_diagnostics["layers"].values())
     if len(layer_metrics) > 0:
-        edit_diagnostics["aggregate"] = {
+        agg = {
             "mean_update_norm": float(
                 sum(metric["update_norm"] for metric in layer_metrics) / len(layer_metrics)
             ),
@@ -233,7 +306,28 @@ def apply_AlphaEdit_to_model(
             "projection_applied_layers": int(
                 sum(1 for metric in layer_metrics if metric["projection_applied"])
             ),
+            "mean_delta_spectral": float(
+                sum(metric["delta_spectral"] for metric in layer_metrics) / len(layer_metrics)
+            ),
         }
+
+        # Aggregate diagnostics fields (only present when enable_diagnostics=True)
+        if enable_diagnostics and all("conflict_sub" in m for m in layer_metrics):
+            valid_cs = [m["conflict_sub"] for m in layer_metrics if m.get("conflict_sub") is not None]
+            valid_br = [m["block_ratio"] for m in layer_metrics
+                        if m.get("block_ratio") is not None and not (m["block_ratio"] != m["block_ratio"])]
+            valid_raw = [m["delta_raw_fro"] for m in layer_metrics
+                         if m.get("delta_raw_fro") is not None and not (m["delta_raw_fro"] != m["delta_raw_fro"])]
+            valid_blk = [m["delta_block_fro"] for m in layer_metrics
+                         if m.get("delta_block_fro") is not None and not (m["delta_block_fro"] != m["delta_block_fro"])]
+            agg.update({
+                "mean_conflict_sub":    float(sum(valid_cs) / len(valid_cs))  if valid_cs  else None,
+                "mean_block_ratio":     float(sum(valid_br) / len(valid_br))  if valid_br  else None,
+                "mean_delta_raw_fro":   float(sum(valid_raw) / len(valid_raw)) if valid_raw else None,
+                "mean_delta_block_fro": float(sum(valid_blk) / len(valid_blk)) if valid_blk else None,
+            })
+
+        edit_diagnostics["aggregate"] = agg
 
     print(f"Deltas successfully computed for {list(weights.keys())}")
     return model, cache_c, edit_diagnostics

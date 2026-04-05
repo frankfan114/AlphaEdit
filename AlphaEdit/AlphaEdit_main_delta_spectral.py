@@ -194,6 +194,9 @@ def apply_AlphaEdit_delta_spectral_to_model(
             "projection_applied_layers": int(
                 sum(1 for m in layer_metrics if m["projection_applied"])
             ),
+            "mean_delta_spectral": float(
+                sum(m["post_clip_spectral_norm"] for m in layer_metrics) / len(layer_metrics)
+            ),
         }
 
     print(f"Deltas successfully computed for {list(weights.keys())}")

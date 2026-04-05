@@ -1,7 +1,9 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+import csv
 import json
 import shutil
+from datetime import datetime
 from itertools import islice
 from time import time
 from typing import Tuple, Union
@@ -30,8 +32,6 @@ from memit.memit_seq_main import apply_memit_seq_to_model
 from memit.memit_rect_main import apply_memit_rect_to_model
 from AlphaEdit import AlphaEditHyperParams
 from AlphaEdit.AlphaEdit_main import apply_AlphaEdit_to_model, get_cov
-from AlphaEdit.AlphaEdit_main_delta_fro import apply_AlphaEdit_delta_fro_to_model
-from AlphaEdit.AlphaEdit_main_delta_spectral import apply_AlphaEdit_delta_spectral_to_model
 from AlphaEdit.analysis_tools import (
     aggregate_probe_metrics,
     clone_rewrite_weights,
@@ -50,8 +50,6 @@ from nse.nse_main import apply_nse_to_model
 from glue_eval.glue_eval import GLUEEval
 ALG_DICT = {
     "AlphaEdit": (AlphaEditHyperParams, apply_AlphaEdit_to_model),
-    "AlphaEditDeltaFro": (AlphaEditHyperParams, apply_AlphaEdit_delta_fro_to_model),
-    "AlphaEditDeltaSpectral": (AlphaEditHyperParams, apply_AlphaEdit_delta_spectral_to_model),
     "MEMIT_seq": (MEMITHyperParams, apply_memit_seq_to_model),
     "MEMIT_prune": (MEMITHyperParams, apply_memit_to_model),
     "MEMIT_rect": (MEMITHyperParams, apply_memit_rect_to_model),
@@ -103,6 +101,8 @@ def main(
     num_edits: int = 1,
     use_cache: bool = False,
     args = None,
+    enable_diagnostics: bool = False,
+    diagnostics_save_path: str = "",
 ):
     # Set algorithm-specific variables
     params_class, apply_algo = ALG_DICT[alg_name]
@@ -142,7 +142,7 @@ def main(
             else HPARAMS_DIR / alg_name / hparams_fname
         )
     hparams = params_class.from_json(params_path)
-    if alg_name in ("AlphaEdit", "AlphaEditDeltaFro", "AlphaEditDeltaSpectral") and args is not None:
+    if alg_name == "AlphaEdit" and args is not None:
         hparams.numerical_stability = args.numerical_stability
         hparams.stability_spectral_multiplier = args.stability_spectral_multiplier
         hparams.stability_condition_number = args.stability_condition_number
@@ -154,6 +154,12 @@ def main(
         hparams.delta_fro_tau = args.delta_fro_tau
         hparams.delta_fro_ratio = args.delta_fro_ratio
         hparams.delta_spectral_tau = args.delta_spectral_tau
+    # Override diagnostics flags from args (works for all alg_names, no-op if not AlphaEdit)
+    if args is not None:
+        if hasattr(args, "enable_diagnostics"):
+            enable_diagnostics = args.enable_diagnostics
+        if hasattr(args, "diagnostics_save_path") and args.diagnostics_save_path:
+            diagnostics_save_path = args.diagnostics_save_path
     
     
     # if not (run_dir / "0_params.json").exists():
@@ -186,6 +192,8 @@ def main(
             "conflict_loss_weight": args.conflict_loss_weight if args is not None else None,
             "conflict_margin": args.conflict_margin if args is not None else None,
             "analysis_top_singular_values": args.analysis_top_singular_values if args is not None else None,
+            "enable_diagnostics": args.enable_diagnostics if args is not None and hasattr(args, "enable_diagnostics") else False,
+            "diagnostics_save_path": args.diagnostics_save_path if args is not None and hasattr(args, "diagnostics_save_path") else "",
         }
 
         # 3. 合并成一个实验配置快照
@@ -299,6 +307,28 @@ def main(
         weight_reference = clone_rewrite_weights(model, hparams)
     else:
         weight_reference = None
+
+    # ── Diagnostics JSONL setup ──────────────────────────────────────────────
+    # When enable_diagnostics=True (and alg_name=="AlphaEdit"), we write one
+    # JSONL record per sequential edit step containing:
+    #   • conflict_sub(t) and block_ratio(t) per layer
+    #   • update norms
+    #   • eval metrics (ES/locality) at analysis_interval steps
+    # When enable_diagnostics=False the file handle stays None and no overhead
+    # is added to the baseline run.
+    _diag_fh = None  # JSONL file handle
+    if enable_diagnostics and alg_name == "AlphaEdit":
+        if not diagnostics_save_path:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            _model_tag = model_name.replace("/", "_") if isinstance(model_name, str) else "model"
+            diagnostics_save_path = str(
+                run_dir / f"diagnostics_{alg_name}_{_model_tag}_{ds_name}_n{num_edits}_{ts}.jsonl"
+            )
+        import pathlib
+        pathlib.Path(diagnostics_save_path).parent.mkdir(parents=True, exist_ok=True)
+        _diag_fh = open(diagnostics_save_path, "a")
+        print(f"[diagnostics] Writing step-level diagnostics to: {diagnostics_save_path}")
+    # ─────────────────────────────────────────────────────────────────────────
     # hs = get_module_input_output_at_words(
     #         model,
     #         tok,
@@ -354,6 +384,7 @@ def main(
         seq_args = dict(cache_c=cache_c) if any(alg in alg_name for alg in ["AlphaEdit", "MEMIT_seq", "NSE"]) else dict()
         nc_args = dict(P = P) if any(alg in alg_name for alg in ["AlphaEdit"]) else dict()
         stability_args = dict(weight_reference=weight_reference) if alg_name == "AlphaEdit" else dict()
+        diag_args = dict(enable_diagnostics=enable_diagnostics) if alg_name == "AlphaEdit" else dict()
         if cnt == 0 and args.downstream_eval_steps > 0:#do initial GLUE EVAL WITH ORIGINAL MODEL
             glue_results = {'edit_num': -1}
 
@@ -387,6 +418,7 @@ def main(
                 **seq_args,
                 **nc_args,
                 **stability_args,
+                **diag_args,
             )
         elif any(alg in alg_name for alg in ["MEMIT_seq", "NSE"]):
             edited_model, cache_c = apply_algo(
@@ -556,6 +588,74 @@ def main(
                 round_payload["downstream_eval"] = round_glue_results
             with open(round_save_dir / f"round_{cnt:04d}.json", "w") as f:
                 json.dump(round_payload, f, indent=2)
+
+        # ── Diagnostics JSONL: write one record per step ─────────────────────
+        # Update diagnostics (conflict_sub, block_ratio, …) are always written.
+        # Eval metrics (ES, locality) come from a lightweight current-batch eval
+        # that runs only when diagnostics are enabled — independent of
+        # analysis_interval so the diagnostics run does not need sequential_rounds.
+        if _diag_fh is not None and alg_name == "AlphaEdit" and round_edit_diagnostics is not None:
+            # Collect request metadata from the current chunk
+            _requests_meta = []
+            for _rec in record_chunks:
+                _rw = _rec.get("requested_rewrite", {})
+                _rw_list = _rw if isinstance(_rw, list) else [_rw]
+                for _r in _rw_list:
+                    _t_new  = _r.get("target_new")
+                    _t_true = _r.get("target_true")
+                    _requests_meta.append({
+                        "case_id":    _rec["case_id"],
+                        "subject":    _r.get("subject"),
+                        "relation":   _r.get("relation_id"),
+                        "target_new":  _t_new.get("str")  if isinstance(_t_new,  dict) else _t_new,
+                        "target_true": _t_true.get("str") if isinstance(_t_true, dict) else _t_true,
+                    })
+
+            # Prefer reusing current_batch_eval already computed by the
+            # analysis_interval block; otherwise do a fresh lightweight eval
+            # (current batch only — no history probing).
+            _eval_summary = None
+            try:
+                _eval_summary = round_payload["current_batch_eval"]["summary"]
+            except (NameError, KeyError, TypeError):
+                pass
+            if _eval_summary is None:
+                try:
+                    _cb = evaluate_record_list(model, tok, record_chunks, ds_eval_method)
+                    _eval_summary = _cb.get("summary")
+                except Exception as _ee:
+                    print(f"[diagnostics] Warning: current-batch eval failed – {_ee}")
+
+            _agg = round_edit_diagnostics.get("aggregate", {})
+
+            _diag_record = {
+                "step_id":          cnt,
+                "edits_applied":    cnt * num_edits,
+                "edit_time_sec":    exec_time,
+                "case_ids":         [_rec["case_id"] for _rec in record_chunks],
+                "requests":         _requests_meta,
+                # ── per-layer diagnostics (dict keyed by layer index as string)
+                "layers":           round_edit_diagnostics.get("layers", {}),
+                # ── step-level aggregates ────────────────────────────────────
+                "mean_conflict_sub":              _agg.get("mean_conflict_sub"),
+                "mean_block_ratio":               _agg.get("mean_block_ratio"),
+                "mean_delta_raw_fro":             _agg.get("mean_delta_raw_fro"),
+                "mean_delta_block_fro":           _agg.get("mean_delta_block_fro"),
+                "mean_update_norm":               _agg.get("mean_update_norm"),
+                "mean_update_to_orig_norm_ratio": _agg.get("mean_update_to_orig_norm_ratio"),
+                "mean_delta_spectral":            _agg.get("mean_delta_spectral"),
+                # ── eval metrics (current batch) ─────────────────────────────
+                "edit_success":              _eval_summary.get("edit_success")             if _eval_summary else None,
+                "locality_preservation":     _eval_summary.get("locality_preservation")    if _eval_summary else None,
+                "paraphrase_success":        _eval_summary.get("paraphrase_success")       if _eval_summary else None,
+                "new_first_token_logit":     _eval_summary.get("new_first_token_logit")    if _eval_summary else None,
+                "first_token_logit_margin":  _eval_summary.get("first_token_logit_margin") if _eval_summary else None,
+            }
+
+            _diag_fh.write(json.dumps(_diag_record) + "\n")
+            _diag_fh.flush()
+        # ─────────────────────────────────────────────────────────────────────
+
     # hs = get_module_input_output_at_words(
     #         edited_model,
     #         tok,
@@ -605,7 +705,59 @@ def main(
         #         nethook.get_parameter(model, k)[...] = v.to("cuda")
 
         print("Evaluation took", time() - start)
-    
+
+    # ── Diagnostics finalisation ─────────────────────────────────────────────
+    if _diag_fh is not None:
+        _diag_fh.close()
+        print(f"[diagnostics] Closed JSONL: {diagnostics_save_path}")
+
+        # Best-effort CSV summary (one row per step, flat numeric fields only)
+        try:
+            _csv_path = diagnostics_save_path.replace(".jsonl", "_summary.csv")
+            import csv as _csv_mod
+            _rows = []
+            with open(diagnostics_save_path, "r") as _jf:
+                for _line in _jf:
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    _rec = json.loads(_line)
+                    _flat = {
+                        "step_id":          _rec.get("step_id"),
+                        "edits_applied":    _rec.get("edits_applied"),
+                        "edit_time_sec":    _rec.get("edit_time_sec"),
+                        "mean_conflict_sub":              _rec.get("mean_conflict_sub"),
+                        "mean_block_ratio":               _rec.get("mean_block_ratio"),
+                        "mean_delta_raw_fro":             _rec.get("mean_delta_raw_fro"),
+                        "mean_delta_block_fro":           _rec.get("mean_delta_block_fro"),
+                        "mean_update_norm":               _rec.get("mean_update_norm"),
+                        "mean_update_to_orig_norm_ratio": _rec.get("mean_update_to_orig_norm_ratio"),
+                        "mean_delta_spectral":            _rec.get("mean_delta_spectral"),
+                        "edit_success":          _rec.get("edit_success"),
+                        "locality_preservation": _rec.get("locality_preservation"),
+                        "paraphrase_success":    _rec.get("paraphrase_success"),
+                        "first_token_logit_margin": _rec.get("first_token_logit_margin"),
+                    }
+                    # Flatten per-layer scalars (e.g. layer "13" → conflict_sub_L13)
+                    for _lname, _ldata in (_rec.get("layers") or {}).items():
+                        if not isinstance(_ldata, dict):
+                            continue
+                        for _k, _v in _ldata.items():
+                            if isinstance(_v, (int, float, type(None))):
+                                _flat[f"{_k}_L{_lname}"] = _v
+                    _rows.append(_flat)
+
+            if _rows:
+                _all_keys = list(dict.fromkeys(k for row in _rows for k in row))
+                with open(_csv_path, "w", newline="") as _cf:
+                    writer = _csv_mod.DictWriter(_cf, fieldnames=_all_keys, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(_rows)
+                print(f"[diagnostics] CSV summary saved to: {_csv_path}")
+        except Exception as _e:
+            print(f"[diagnostics] Warning: could not write CSV summary – {_e}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     save_dir = run_dir / "final_model"
     edited_model.save_pretrained(save_dir)
     tok.save_pretrained(save_dir)
@@ -792,6 +944,26 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help="AlphaEditDeltaSpectral: spectral-norm threshold τ_2 for ΔW clipping. 0 = disabled.",
+    )
+    parser.add_argument(
+        "--enable_diagnostics",
+        action="store_true",
+        default=False,
+        help=(
+            "AlphaEdit only: compute and log per-step mechanism-analysis diagnostics "
+            "(conflict_sub, block_ratio) to a JSONL file.  Off by default; adds one "
+            "extra linear solve per layer per step.  Does NOT change any model weights "
+            "or evaluation results."
+        ),
+    )
+    parser.add_argument(
+        "--diagnostics_save_path",
+        type=str,
+        default="",
+        help=(
+            "Path for the diagnostics JSONL file.  Auto-generated from run_dir and "
+            "timestamp when empty (default).  Only used when --enable_diagnostics is set."
+        ),
     )
     parser.add_argument(
         "--knowledge_conflict",

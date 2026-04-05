@@ -145,6 +145,7 @@ def apply_AlphaEdit_delta_fro_to_model(
         # ────────────────────────────────────────────────────────────────────
 
         upd_norm_post = torch.linalg.norm(upd_matrix).item()
+        delta_spectral = torch.linalg.norm(upd_matrix.float(), ord=2).item()
         with torch.no_grad():
             weights[weight_name][...] = weights[weight_name] + upd_matrix
 
@@ -155,6 +156,7 @@ def apply_AlphaEdit_delta_fro_to_model(
             "update_to_orig_norm_ratio": float(upd_norm_post / (orig_norm + 1e-12)),
             "pre_clip_delta_norm": clip_info["pre_clip_norm"],
             "post_clip_delta_norm": clip_info["post_clip_norm"],
+            "delta_spectral": delta_spectral,
             "clip_scale": clip_info["scale"],
             "clip_applied": clip_info["clipped"],
             # keep same keys as baseline for compatibility with plot script
@@ -195,6 +197,9 @@ def apply_AlphaEdit_delta_fro_to_model(
             ),
             "projection_applied_layers": int(
                 sum(1 for m in layer_metrics if m["projection_applied"])
+            ),
+            "mean_delta_spectral": float(
+                sum(m["delta_spectral"] for m in layer_metrics) / len(layer_metrics)
             ),
         }
 
