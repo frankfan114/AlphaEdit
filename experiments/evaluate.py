@@ -611,9 +611,8 @@ def main(
                         "target_true": _t_true.get("str") if isinstance(_t_true, dict) else _t_true,
                     })
 
-            # Prefer reusing current_batch_eval already computed by the
-            # analysis_interval block; otherwise do a fresh lightweight eval
-            # (current batch only — no history probing).
+            # Current-batch eval: reuse from analysis_interval block if available,
+            # otherwise run a fresh lightweight eval on the current batch only.
             _eval_summary = None
             try:
                 _eval_summary = round_payload["current_batch_eval"]["summary"]
@@ -625,6 +624,25 @@ def main(
                     _eval_summary = _cb.get("summary")
                 except Exception as _ee:
                     print(f"[diagnostics] Warning: current-batch eval failed – {_ee}")
+
+            # History probe eval: only available when analysis_interval fires.
+            # Random probe: mixed age sample.
+            # Oldest probe: EARLIEST edited records — most at risk of forgetting.
+            # Stratified probe: 4 quartile buckets (q1_oldest … q4_recent).
+            _hp_summary = None
+            _hp_oldest_summary = None
+            _hp_strat_summaries = {}   # keyed by stratum label
+            try:
+                _hp_summary        = round_payload["history_probe_eval"]["summary"]
+                _hp_oldest_summary = round_payload["history_probe_oldest_eval"]["summary"]
+            except (NameError, KeyError, TypeError):
+                pass
+            try:
+                for _stratum, _strat_eval in round_payload["history_probe_stratified_eval"].items():
+                    if isinstance(_strat_eval, dict) and "summary" in _strat_eval:
+                        _hp_strat_summaries[_stratum] = _strat_eval["summary"]
+            except (NameError, KeyError, TypeError):
+                pass
 
             _agg = round_edit_diagnostics.get("aggregate", {})
 
@@ -639,17 +657,42 @@ def main(
                 # ── step-level aggregates ────────────────────────────────────
                 "mean_conflict_sub":              _agg.get("mean_conflict_sub"),
                 "mean_block_ratio":               _agg.get("mean_block_ratio"),
+                "mean_rhs_block_ratio":           _agg.get("mean_rhs_block_ratio"),
                 "mean_delta_raw_fro":             _agg.get("mean_delta_raw_fro"),
                 "mean_delta_block_fro":           _agg.get("mean_delta_block_fro"),
                 "mean_update_norm":               _agg.get("mean_update_norm"),
                 "mean_update_to_orig_norm_ratio": _agg.get("mean_update_to_orig_norm_ratio"),
                 "mean_delta_spectral":            _agg.get("mean_delta_spectral"),
-                # ── eval metrics (current batch) ─────────────────────────────
+                # ── eval metrics: current batch (immediate write success) ────
                 "edit_success":              _eval_summary.get("edit_success")             if _eval_summary else None,
                 "locality_preservation":     _eval_summary.get("locality_preservation")    if _eval_summary else None,
                 "paraphrase_success":        _eval_summary.get("paraphrase_success")       if _eval_summary else None,
                 "new_first_token_logit":     _eval_summary.get("new_first_token_logit")    if _eval_summary else None,
                 "first_token_logit_margin":  _eval_summary.get("first_token_logit_margin") if _eval_summary else None,
+                # ── history probe eval (retention / forgetting curve) ─────────
+                # Only populated at analysis_interval steps; None otherwise.
+                # random: mixed-age sample
+                "hp_edit_success":       _hp_summary.get("edit_success")          if _hp_summary else None,
+                "hp_locality":           _hp_summary.get("locality_preservation") if _hp_summary else None,
+                "hp_paraphrase_success": _hp_summary.get("paraphrase_success")    if _hp_summary else None,
+                # oldest: earliest edits only — strongest forgetting signal
+                "hp_oldest_edit_success":       _hp_oldest_summary.get("edit_success")          if _hp_oldest_summary else None,
+                "hp_oldest_locality":           _hp_oldest_summary.get("locality_preservation") if _hp_oldest_summary else None,
+                "hp_oldest_paraphrase_success": _hp_oldest_summary.get("paraphrase_success")    if _hp_oldest_summary else None,
+                # stratified quartile probes: q1_oldest / q2 / q3 / q4_recent
+                # Each stratum samples probe_size//4 records from that age bucket.
+                **{
+                    f"strat_{_s}_edit_success":       _hp_strat_summaries[_s].get("edit_success")          if _s in _hp_strat_summaries else None
+                    for _s in ["q1_oldest", "q2", "q3", "q4_recent"]
+                },
+                **{
+                    f"strat_{_s}_locality":           _hp_strat_summaries[_s].get("locality_preservation") if _s in _hp_strat_summaries else None
+                    for _s in ["q1_oldest", "q2", "q3", "q4_recent"]
+                },
+                **{
+                    f"strat_{_s}_paraphrase_success": _hp_strat_summaries[_s].get("paraphrase_success")    if _s in _hp_strat_summaries else None
+                    for _s in ["q1_oldest", "q2", "q3", "q4_recent"]
+                },
             }
 
             _diag_fh.write(json.dumps(_diag_record) + "\n")
@@ -666,45 +709,45 @@ def main(
     #         fact_token_strategy=hparams.fact_token,
     #     )[1].T
     # torch.save(hs, "post_edit_hs_memit.pt")
-    start = time()
-    gen_test_vars = [snips, vec]
-    for record in ds:
-        out_file = Path(case_result_template.format(num_edits, record["case_id"]))
-        if out_file.exists():
-            print(f"Skipping {out_file}; already exists")
-            continue
-        metrics = {
-            "case_id": record["case_id"],
-            "grouped_case_ids": case_ids,
-            "num_edits": num_edits,
-            "requested_rewrite": record["requested_rewrite"],
-            "time": exec_time,
-            "conflict_metrics": compute_conflict_metrics_for_record(
-                edited_model, tok, record
-            ),
-            "post": ds_eval_method(
-                edited_model,
-                tok,
-                record,
-                *(
-                    gen_test_vars
-                    if record["case_id"] % generation_test_interval == 0
-                    else [None, None]
-                ),  # Only test generation every generation_test_interval cases
-            ),
-        }
-        
-        
-        # Dump metrics in .json
-        with open(out_file, "w") as f:
-            json.dump(metrics, f, indent=1)
+    # Skip final per-record eval and model saving when --skip_final_eval is set.
+    # Use this for diagnostics runs where the JSONL already captures what's needed.
+    _skip_final = getattr(args, "skip_final_eval", False) if args is not None else False
+    if not _skip_final:
+        start = time()
+        gen_test_vars = [snips, vec]
+        for record in ds:
+            out_file = Path(case_result_template.format(num_edits, record["case_id"]))
+            if out_file.exists():
+                print(f"Skipping {out_file}; already exists")
+                continue
+            metrics = {
+                "case_id": record["case_id"],
+                "grouped_case_ids": case_ids,
+                "num_edits": num_edits,
+                "requested_rewrite": record["requested_rewrite"],
+                "time": exec_time,
+                "conflict_metrics": compute_conflict_metrics_for_record(
+                    edited_model, tok, record
+                ),
+                "post": ds_eval_method(
+                    edited_model,
+                    tok,
+                    record,
+                    *(
+                        gen_test_vars
+                        if record["case_id"] % generation_test_interval == 0
+                        else [None, None]
+                    ),  # Only test generation every generation_test_interval cases
+                ),
+            }
 
-        # Restore original weights
-        # with torch.no_grad():
-        #     for k, v in weights_copy.items():
-        #         nethook.get_parameter(model, k)[...] = v.to("cuda")
+            # Dump metrics in .json
+            with open(out_file, "w") as f:
+                json.dump(metrics, f, indent=1)
 
-        print("Evaluation took", time() - start)
+            print("Evaluation took", time() - start)
+    else:
+        print("[skip_final_eval] Skipping final per-record evaluation and model save.")
 
     # ── Diagnostics finalisation ─────────────────────────────────────────────
     if _diag_fh is not None:
@@ -728,6 +771,7 @@ def main(
                         "edit_time_sec":    _rec.get("edit_time_sec"),
                         "mean_conflict_sub":              _rec.get("mean_conflict_sub"),
                         "mean_block_ratio":               _rec.get("mean_block_ratio"),
+                        "mean_rhs_block_ratio":           _rec.get("mean_rhs_block_ratio"),
                         "mean_delta_raw_fro":             _rec.get("mean_delta_raw_fro"),
                         "mean_delta_block_fro":           _rec.get("mean_delta_block_fro"),
                         "mean_update_norm":               _rec.get("mean_update_norm"),
@@ -737,6 +781,9 @@ def main(
                         "locality_preservation": _rec.get("locality_preservation"),
                         "paraphrase_success":    _rec.get("paraphrase_success"),
                         "first_token_logit_margin": _rec.get("first_token_logit_margin"),
+                        "hp_edit_success":       _rec.get("hp_edit_success"),
+                        "hp_locality":           _rec.get("hp_locality"),
+                        "hp_paraphrase_success": _rec.get("hp_paraphrase_success"),
                     }
                     # Flatten per-layer scalars (e.g. layer "13" → conflict_sub_L13)
                     for _lname, _ldata in (_rec.get("layers") or {}).items():
@@ -758,9 +805,10 @@ def main(
             print(f"[diagnostics] Warning: could not write CSV summary – {_e}")
     # ─────────────────────────────────────────────────────────────────────────
 
-    save_dir = run_dir / "final_model"
-    edited_model.save_pretrained(save_dir)
-    tok.save_pretrained(save_dir)
+    if not _skip_final:
+        save_dir = run_dir / "final_model"
+        edited_model.save_pretrained(save_dir)
+        tok.save_pretrained(save_dir)
 
     
     
@@ -944,6 +992,15 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help="AlphaEditDeltaSpectral: spectral-norm threshold τ_2 for ΔW clipping. 0 = disabled.",
+    )
+    parser.add_argument(
+        "--skip_final_eval",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the final per-record evaluation loop and model save. "
+            "Use for diagnostics runs where the JSONL captures all needed data."
+        ),
     )
     parser.add_argument(
         "--enable_diagnostics",

@@ -7,13 +7,14 @@ late-stage Edit-Success (ES) decay during long sequential editing runs.
 Key quantities
 --------------
 conflict_sub(t)
-    Fraction of the current edit's key-vector energy that lies inside the
-    *protected null-space* (the subspace AlphaEdit is constrained to update).
-    A rising trend over steps suggests that later edits increasingly demand
-    updates in the very subspace AlphaEdit forbids modifying.
+    Fraction of the current edit's key-vector energy that lies in the
+    *blocked* directions — the complement of the null-space (i.e. the
+    high-eigenvalue subspace that AlphaEdit forbids updating).
+    A rising trend means later edits increasingly point in directions
+    AlphaEdit cannot modify.
 
     Definition (per layer ℓ, step t):
-        conflict_sub(t) = ‖P_ℓ k_t‖² / ‖k_t‖²
+        conflict_sub(t) = 1 - ‖P_ℓ k_t‖² / ‖k_t‖²  =  ‖(I-P_ℓ) k_t‖² / ‖k_t‖²
     where
         P_ℓ  = U₀ U₀ᵀ   (fixed null-space projector, never updated)
         k_t  = mean key vector for the current edit (mean over context copies)
@@ -96,7 +97,7 @@ def compute_conflict_sub(
     Pk_norm_sq = float((Pk @ Pk).item())
 
     return {
-        "conflict_sub": Pk_norm_sq / (k_norm_sq + 1e-12),
+        "conflict_sub": 1.0 - Pk_norm_sq / (k_norm_sq + 1e-12),  # fraction of k in BLOCKED (complement) directions
         "k_t_norm":     float(k_norm_sq ** 0.5),
     }
 
@@ -179,6 +180,58 @@ def compute_block_ratio(
             "delta_allow_fro": float("nan"),
             "delta_block_fro": float("nan"),
             "solve_failed":   True,
+        }
+
+
+def compute_rhs_block_ratio(
+    layer_ks: torch.Tensor,    # [d_key, n]
+    resid:    torch.Tensor,    # [d_out, n]
+    P_layer:  torch.Tensor,    # [d_key, d_key]
+) -> Dict:
+    """
+    Compute rhs_block_ratio(t) — a simpler, C-independent measure of how much
+    of the edit's target signal is blocked by the null-space projector.
+
+    Instead of solving the full linear system, we look directly at the
+    right-hand side signal b = K Rᵀ and decompose it via P:
+
+        b_total  = K Rᵀ                    [d_key, d_out]
+        b_allow  = P @ b_total             (component in null-space, allowed)
+        b_block  = (I − P) @ b_total       (component blocked by AlphaEdit)
+
+        rhs_block_ratio = ‖b_block‖_F / (‖b_total‖_F + ε)
+
+    Unlike block_ratio, this does NOT depend on cache_c or the linear solve.
+    It purely reflects the geometric alignment of the current edit's key-target
+    direction with the protected subspace — making it cleaner for tracking
+    how the edit intent conflicts with the null-space constraint over time.
+    """
+    try:
+        K = layer_ks.detach().float()
+        R = resid.detach().float()
+        P = P_layer.detach().float().to(K.device)
+
+        b_total = K @ R.T                  # [d_key, d_out]
+        b_allow = P @ b_total              # [d_key, d_out]
+        b_block = b_total - b_allow        # [d_key, d_out]
+
+        total_fro = float(torch.linalg.norm(b_total, ord="fro").item())
+        allow_fro = float(torch.linalg.norm(b_allow, ord="fro").item())
+        block_fro = float(torch.linalg.norm(b_block, ord="fro").item())
+
+        return {
+            "rhs_block_ratio":  block_fro / (total_fro + 1e-12),
+            "rhs_total_fro":    total_fro,
+            "rhs_allow_fro":    allow_fro,
+            "rhs_block_fro":    block_fro,
+        }
+    except Exception as exc:
+        warnings.warn(f"[diagnostics] compute_rhs_block_ratio failed: {exc}")
+        return {
+            "rhs_block_ratio": float("nan"),
+            "rhs_total_fro":   float("nan"),
+            "rhs_allow_fro":   float("nan"),
+            "rhs_block_fro":   float("nan"),
         }
 
 

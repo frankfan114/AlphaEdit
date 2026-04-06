@@ -20,6 +20,7 @@ from .delta_clipping import clip_delta_frobenius, clip_delta_spectral
 from .diagnostics import (
     compute_conflict_sub,
     compute_block_ratio,
+    compute_rhs_block_ratio,
     protected_rank_from_projector,
 )
 # Cache variable(s)
@@ -225,6 +226,8 @@ def apply_AlphaEdit_to_model(
             # block_ratio(t) = ‖Δ_block‖_F / ‖Δ_raw‖_F
             # Δ_raw is the MEMIT-style update (no null-space constraint).
             # Δ_block = (I − P) @ Δ_raw  (LEFT mult on key dimension).
+            # Note: Δ_raw is shaped by cache_c, so block_ratio can drift
+            # as C accumulates.  See rhs_block_ratio for a C-free alternative.
             block_info = compute_block_ratio(
                 layer_ks,
                 resid,
@@ -233,17 +236,27 @@ def apply_AlphaEdit_to_model(
                 hparams.L2,
             )
 
+            # rhs_block_ratio(t) = ‖(I−P) K Rᵀ‖_F / ‖K Rᵀ‖_F
+            # Directly measures how much of the edit's key-target signal
+            # lies in the forbidden directions.  Independent of cache_c.
+            rhs_info = compute_rhs_block_ratio(layer_ks, resid, P_i)
+
             p_rank = protected_rank_from_projector(P_i)
             layer_diag.update({
                 # conflict_sub(t)
                 "conflict_sub":    conflict_info["conflict_sub"],
                 "k_t_norm":        conflict_info["k_t_norm"],
-                # block_ratio(t)
+                # block_ratio(t)  — C-dependent (MEMIT solution decomposition)
                 "block_ratio":     block_info["block_ratio"],
                 "delta_raw_fro":   block_info["delta_raw_fro"],
                 "delta_allow_fro": block_info["delta_allow_fro"],
                 "delta_block_fro": block_info["delta_block_fro"],
                 "diag_solve_failed": block_info["solve_failed"],
+                # rhs_block_ratio(t) — C-independent (RHS signal decomposition)
+                "rhs_block_ratio": rhs_info["rhs_block_ratio"],
+                "rhs_total_fro":   rhs_info["rhs_total_fro"],
+                "rhs_allow_fro":   rhs_info["rhs_allow_fro"],
+                "rhs_block_fro":   rhs_info["rhs_block_fro"],
                 # subspace structure
                 "protected_rank":  p_rank,
                 "total_dim":       P_i.shape[0],
@@ -320,11 +333,14 @@ def apply_AlphaEdit_to_model(
                          if m.get("delta_raw_fro") is not None and not (m["delta_raw_fro"] != m["delta_raw_fro"])]
             valid_blk = [m["delta_block_fro"] for m in layer_metrics
                          if m.get("delta_block_fro") is not None and not (m["delta_block_fro"] != m["delta_block_fro"])]
+            valid_rhs = [m["rhs_block_ratio"] for m in layer_metrics
+                         if m.get("rhs_block_ratio") is not None and not (m["rhs_block_ratio"] != m["rhs_block_ratio"])]
             agg.update({
-                "mean_conflict_sub":    float(sum(valid_cs) / len(valid_cs))  if valid_cs  else None,
-                "mean_block_ratio":     float(sum(valid_br) / len(valid_br))  if valid_br  else None,
-                "mean_delta_raw_fro":   float(sum(valid_raw) / len(valid_raw)) if valid_raw else None,
-                "mean_delta_block_fro": float(sum(valid_blk) / len(valid_blk)) if valid_blk else None,
+                "mean_conflict_sub":      float(sum(valid_cs) / len(valid_cs))   if valid_cs  else None,
+                "mean_block_ratio":       float(sum(valid_br) / len(valid_br))   if valid_br  else None,
+                "mean_delta_raw_fro":     float(sum(valid_raw) / len(valid_raw)) if valid_raw else None,
+                "mean_delta_block_fro":   float(sum(valid_blk) / len(valid_blk)) if valid_blk else None,
+                "mean_rhs_block_ratio":   float(sum(valid_rhs) / len(valid_rhs)) if valid_rhs else None,
             })
 
         edit_diagnostics["aggregate"] = agg
